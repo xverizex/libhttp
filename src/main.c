@@ -34,12 +34,12 @@ static int is_end (uint8_t *b, ssize_t len)
 	return 0;
 }
 
-static size_t handle (int fd, int64_t size)
+static void handle (struct client_struc *cs)
 {
 	uint8_t buf[MSG_BUF_SIZE];
 	uint64_t ret = 0;
 	for (;;) {
-		ssize_t len = read (fd, buf, MSG_BUF_SIZE);
+		ssize_t len = read (cs->fd, buf, MSG_BUF_SIZE);
 		if (len == -1) {
 			perror ("read");
 			exit (EXIT_FAILURE);
@@ -51,65 +51,145 @@ static size_t handle (int fd, int64_t size)
 			break;
 		}
 
-		ssize_t l = len;
-		if ((size - len) < 0) {
-			l = size - len;
-			size -= l;
-		} 
-
-		memcpy (m, buf, l);
-
-		m += l;
-		ret += l;
-
-		if (size == 0L)
-			break;
 		if (end)
 			break;
 	}
-
-	mem[ret] = 0;
-	return ret;
 }
 
-int main (int argc, char **argv)
+static void *malloc_and_set (uint64_t size, uint8_t byte)
 {
-	int sock = socket (AF_INET, SOCK_STREAM, 0);
-	if (sock == -1) {
-		perror ("socket");
-		exit (EXIT_FAILURE);
+	void *data = malloc (size);
+	memset (data, byte, size);
+	return data;
+}
+static uint32_t listen_free_get_index (uint32_t *listen_free, int max_available_clients)
+{
+	for (int i = 0; i < max_available_clients; i++) {
+		if (listen_free[i])
+			return i;
+	}
+
+	return UINT32_MAX;
+}
+
+struct pool_client_struc {
+	int max;
+	struct client_struc *cs;
+};
+
+static void close_client (struct pool_client_struc *pool_cs, int indx)
+{
+	struct client_struc *deletable_cs = &pool_cs->cs[indx];
+
+	int max = pool_cs->max;
+
+	for (int i = 0; i < max; i++) {
+		struct client_struc *cs = &pool_cs->cs[i];
+
+		if (cs == deletable_cs) {
+			close (cs->fd);
+			if (cs->filename)
+				free (cs->filename);
+			if (cs->fp)
+				fclose (cs->fp);
+
+			int left = max - i;
+			int all_left_size = left * sizeof (struct client_struc);
+
+			if ((i + 1) == max)
+				break;
+
+			uint8_t *bytes = malloc (all_left_size);
+			memcpy (bytes, &pool_cs->cs[i + 1], all_left_size);
+			memcpy (&pool_cs->cs[i], bytes, all_left_size);
+			free (bytes);
+			break;
+		}
+	}
+
+	max--;
+	memset (&pool_cs->cs[max], 0, sizeof (struct client_struc));
+	pool_cs->max = max;
+}
+
+static void restructure_fds (struct pollfd *fds, nfds_t *nfds, struct pool_client_struc *pool_cs)
+{
+	int max = pool_cs->max;
+	*nfds = max;
+	for (int i = 0; i < max; i++) {
+		fds[i].fd = pool_cs->cs[i].fd;
+		fds[i].events = POLLIN;
+	}
+}
+
+struct http_struc {
+	int server_fd;
+	int max_avail;
+};
+
+struct http_struc *libhttp_init_struct (const char *ip, uint16_t port, int max_avail)
+{
+	int ret;
+	int sock = ret = socket (AF_INET, SOCK_STREAM, 0);
+	if (ret == -1) {
+		return NULL;
 	}
 
 	int opt = 1;
 	setsockopt (sock, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof (opt));
+	setsockopt (sock, SOL_SOCKET, SO_KEEPALIVE, &opt, sizeof (opt));
 
 	struct sockaddr_in s;
 	s.sin_family = AF_INET;
-	s.sin_port = htons (8080);
-	inet_aton ("0.0.0.0", &s.sin_addr);
+	s.sin_port = htons (port);
+	inet_aton (ip, &s.sin_addr);
 
-	int ret = bind (sock, (const struct sockaddr *) &s, sizeof (s));
+	ret = bind (sock, (const struct sockaddr *) &s, sizeof (s));
 	if (ret == -1) {
-		perror ("bind");
-		exit (EXIT_FAILURE);
+		close (sock);
+		return NULL;
 	}
 
-	listen (sock, 0);
+	ret = listen (sock, max_avail);
+	if (ret == -1) {
+		close (sock);
+		return NULL;
+	}
+
+	struct http_struc *http = malloc_and_set (sizeof (struct http_struc), 0);
+	http->server_fd = sock;
+	http->max_avail = max_avail;
+
+	return http;
+}
+
+
+int main (int argc, char **argv)
+{
+
+	struct http_struc *http = libhttp_init_struct ("0.0.0.0", 8080, 5);
 
 	struct sockaddr_in c;
 	socklen_t sc = sizeof (c);
 
-	int n = 0;
-	char filename[512];
+	struct pollfd fds[http->max_avail];
+	nfds_t nfds = 0;
+
+	uint32_t *listen_free = malloc_and_set (sizeof (uint32_t) * http->max_avail, 0);
+
+	struct pool_client_struc *pool_cs = malloc_and_set (sizeof (struct pool_client_struc), 0);
+	pool_cs->cs = malloc_and_set (sizeof (struct client_struc) * http->max_avail, 0);
+
 	while (1) {
-		int client = accept (sock, (struct sockaddr *) &c, &sc);
+		int client = accept (http->server_fd, (struct sockaddr *) &c, &sc);
+		nfds++;
 
-		struct pollfd fds[1];
-		nfds_t nfds = 1;
-		fds[0].fd = client;
-		fds[0].events = POLLIN;
+		int indx = listen_free_get_index (listen_free, http->max_avail);
 
-		struct client_struc *cs = malloc (sizeof (struct client_struc));
+		fds[indx].fd = client;
+		fds[indx].events = POLLIN;
+
+		struct client_struc *cs = &pool_cs->cs[indx];
 		cs->fd = client;
 
 		while (1) {
@@ -123,21 +203,19 @@ int main (int argc, char **argv)
 			}
 
 			if (poll_num > 0) {
-				if (fds[0].revents & POLLIN) {
-					size_t len = handle (client);
-					if (len == 0)
-						continue;
+				for (int i = 0; i < nfds; i++) {
 
-					printf ("readed: %lu\n", len);
-					snprintf (filename, 512, "%d.txt", n++);
-					FILE *fp = fopen (filename, "w");
-					fwrite (mem, len, 1, fp);
-					fclose (fp);
+					struct client_struc *cs = &pool_cs->cs[i];
+
+					if (fds[i].revents & POLLIN) {
+						handle (cs);
+					}
+					if (fds[i].revents & POLLNVAL) {
+						close_client (pool_cs, i);
+						restructure_fds (fds, &nfds, pool_cs);
+					}
 				}
 			}
-
-
 		}
-		close (client);
 	}
 }
