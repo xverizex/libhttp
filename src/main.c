@@ -8,60 +8,114 @@
 #include <errno.h>
 #include <stdint.h>
 #include <sys/poll.h>
+#include <pthread.h>
 
-struct client_struc {
-	int fd;
-	char *filename;
-	FILE *fp;
+#define MSG_BUF_SIZE               16384
+#define LENGTH_FILENAME             4096
+#define PATTERN_GLOBAL_NUM      "files/%lu.data"
+
+struct htx_pool_http {
+	int max;
+	struct htx_http_struc **http;
 };
+
+struct htx_http_struc {
+	int server_fd;
+	int max_avail;
+	pthread_t thread;
+	struct htx_pool_client_struc *pool_cs;
+	uint32_t *listen_free;
+};
+
+struct htx_client_struc {
+	int fd;
+	struct sockaddr_in c;
+	socklen_t sc;
+};
+
+struct htx_pool_client_struc {
+	int max;
+	struct htx_client_struc *cs;
+};
+
+struct htx_com_file {
+	int fd;
+	char filename[LENGTH_FILENAME];
+};
+
+struct htx_client_com {
+	int fd;
+	struct char *filename[LENGTH_FILENAME];
+	int max;
+};
+
+static uint64_t global_file_number;
 
 static const uint64_t filesize_mb = 10;
 static uint64_t filesize_in_bytes = filesize_mb * 1024 * 1024;
 
-#define MSG_BUF_SIZE               16384
+
+static void *htx_malloc_and_set (uint64_t size, uint8_t byte)
+{
+	void *data = malloc (size);
+	memset (data, byte, size);
+	return data;
+}
 
 static int is_end (uint8_t *b, ssize_t len)
 {
-	b += len - 4;
+	b += len - 2;
 
-	if (*(b + 2) == 0x0d && *(b + 3) == 0x0a) {
-		if (*(b + 0) == 0x0d && *(b + 1) == 0x0a)
-			return 0;
-
+	if (*(b + 0) == 0x0d && *(b + 1) == 0x0a) {
 		return 1;
 	}
 
 	return 0;
 }
 
-static void handle (struct client_struc *cs)
+static void handle (struct htx_client_struc *cs, struct htx_com_file **hpf)
 {
+	*hpf = NULL;
+
+	char filename[4096];
+	snprintf (filename, 4096, PATTERN_GLOBAL_NUM, global_file_number++);
+
 	uint8_t buf[MSG_BUF_SIZE];
 	uint64_t ret = 0;
+
+	FILE *fp = fopen (filename, "w");
+
+	struct htx_com_file *hp = htx_malloc_and_set (sizeof (struct htx_com_file), 0);
+
 	for (;;) {
 		ssize_t len = read (cs->fd, buf, MSG_BUF_SIZE);
 		if (len == -1) {
+			free (hp);
 			perror ("read");
 			exit (EXIT_FAILURE);
 		}
 		buf[len] = 0;
 		int end = is_end (buf, len);
 
-		if (len <= 0) {
+		if (len < 0) {
 			break;
 		}
+
+		fwrite (buf, len, 1, fp);
 
 		if (end)
 			break;
 	}
+
+	fclose (fp);
+
+	size_t ln_filename = strlen (filename);
+	memcpy (hp->filename, filename, ln_filename + 1);
+	hp->fd = cs->fd;
+	
+	*hpf = hp;
 }
 
-static void *malloc_and_set (uint64_t size, uint8_t byte)
-{
-	void *data = malloc (size);
-	memset (data, byte, size);
-	return data;
-}
 static uint32_t listen_free_get_index (uint32_t *listen_free, int max_available_clients)
 {
 	for (int i = 0; i < max_available_clients; i++) {
@@ -72,29 +126,21 @@ static uint32_t listen_free_get_index (uint32_t *listen_free, int max_available_
 	return UINT32_MAX;
 }
 
-struct pool_client_struc {
-	int max;
-	struct client_struc *cs;
-};
 
-static void close_client (struct pool_client_struc *pool_cs, int indx)
+static void close_client (struct htx_pool_client_struc *pool_cs, int indx)
 {
-	struct client_struc *deletable_cs = &pool_cs->cs[indx];
+	struct htx_client_struc *deletable_cs = &pool_cs->cs[indx];
 
 	int max = pool_cs->max;
 
 	for (int i = 0; i < max; i++) {
-		struct client_struc *cs = &pool_cs->cs[i];
+		struct htx_client_struc *cs = &pool_cs->cs[i];
 
 		if (cs == deletable_cs) {
 			close (cs->fd);
-			if (cs->filename)
-				free (cs->filename);
-			if (cs->fp)
-				fclose (cs->fp);
 
 			int left = max - i;
-			int all_left_size = left * sizeof (struct client_struc);
+			int all_left_size = left * sizeof (struct htx_client_struc);
 
 			if ((i + 1) == max)
 				break;
@@ -108,11 +154,11 @@ static void close_client (struct pool_client_struc *pool_cs, int indx)
 	}
 
 	max--;
-	memset (&pool_cs->cs[max], 0, sizeof (struct client_struc));
+	memset (&pool_cs->cs[max], 0, sizeof (struct htx_client_struc));
 	pool_cs->max = max;
 }
 
-static void restructure_fds (struct pollfd *fds, nfds_t *nfds, struct pool_client_struc *pool_cs)
+static void restructure_fds (struct pollfd *fds, nfds_t *nfds, struct htx_pool_client_struc *pool_cs)
 {
 	int max = pool_cs->max;
 	*nfds = max;
@@ -122,12 +168,8 @@ static void restructure_fds (struct pollfd *fds, nfds_t *nfds, struct pool_clien
 	}
 }
 
-struct http_struc {
-	int server_fd;
-	int max_avail;
-};
 
-struct http_struc *libhttp_init_struct (const char *ip, uint16_t port, int max_avail)
+struct htx_http_struc *htx_init_struct (const char *ip, uint16_t port, int max_avail)
 {
 	int ret;
 	int sock = ret = socket (AF_INET, SOCK_STREAM, 0);
@@ -156,7 +198,7 @@ struct http_struc *libhttp_init_struct (const char *ip, uint16_t port, int max_a
 		return NULL;
 	}
 
-	struct http_struc *http = malloc_and_set (sizeof (struct http_struc), 0);
+	struct htx_http_struc *http = htx_malloc_and_set (sizeof (struct htx_http_struc), 0);
 	http->server_fd = sock;
 	http->max_avail = max_avail;
 
@@ -164,32 +206,66 @@ struct http_struc *libhttp_init_struct (const char *ip, uint16_t port, int max_a
 }
 
 
-int main (int argc, char **argv)
+int htx_pool_http_add (struct htx_pool_http *ph, struct htx_http_struc *http)
+{
+	int max = ph->max;
+	int indx = max++;
+	struct htx_http_struc **ht = realloc (ph->http, sizeof (struct htx_http_struc) * max);
+	if (!ht) {
+		return 1;
+	}
+
+	ht[indx] = http;
+	ph->http = ht;
+	ph->max;
+
+	return 0;
+}
+
+static void free_http (struct htx_http_struc *http)
+{
+	close (http->server_fd);
+	free (http);
+}
+
+void htx_pool_http_free (struct htx_pool_http *ph)
+{
+	for (int i = 0; i < ph->max; i++) {
+		free_http (ph->http[i]);
+	}
+
+	free (ph);
+}
+
+static void init_http (struct htx_http_struc *http)
 {
 
-	struct http_struc *http = libhttp_init_struct ("0.0.0.0", 8080, 5);
 
-	struct sockaddr_in c;
-	socklen_t sc = sizeof (c);
+	http->listen_free = htx_malloc_and_set (sizeof (uint32_t) * http->max_avail, 0);
+
+	http->pool_cs = htx_malloc_and_set (sizeof (struct htx_pool_client_struc), 0);
+	http->pool_cs->cs = htx_malloc_and_set (sizeof (struct htx_client_struc) * http->max_avail, 0);
+}
+
+static void *worker_http (void *_data)
+{
+	struct htx_http_struc *http = (struct htx_http_struc *) _data;
 
 	struct pollfd fds[http->max_avail];
 	nfds_t nfds = 0;
 
-	uint32_t *listen_free = malloc_and_set (sizeof (uint32_t) * http->max_avail, 0);
-
-	struct pool_client_struc *pool_cs = malloc_and_set (sizeof (struct pool_client_struc), 0);
-	pool_cs->cs = malloc_and_set (sizeof (struct client_struc) * http->max_avail, 0);
+	socklen_t sc = sizeof (struct sockaddr_in);
 
 	while (1) {
-		int client = accept (http->server_fd, (struct sockaddr *) &c, &sc);
-		nfds++;
+		int indx = listen_free_get_index (http->listen_free, http->max_avail);
+		struct htx_client_struc *cs = &http->pool_cs->cs[indx];
 
-		int indx = listen_free_get_index (listen_free, http->max_avail);
+		int client = accept (http->server_fd, (struct sockaddr *) &cs->c, &cs->sc);
+		nfds++;
 
 		fds[indx].fd = client;
 		fds[indx].events = POLLIN;
 
-		struct client_struc *cs = &pool_cs->cs[indx];
 		cs->fd = client;
 
 		while (1) {
@@ -205,17 +281,52 @@ int main (int argc, char **argv)
 			if (poll_num > 0) {
 				for (int i = 0; i < nfds; i++) {
 
-					struct client_struc *cs = &pool_cs->cs[i];
+					struct htx_client_struc *cs = &http->pool_cs->cs[i];
+
+					struct htx_com_file *com_file = NULL;
 
 					if (fds[i].revents & POLLIN) {
-						handle (cs);
+						handle (cs, &com_file);
 					}
 					if (fds[i].revents & POLLNVAL) {
-						close_client (pool_cs, i);
-						restructure_fds (fds, &nfds, pool_cs);
+						close_client (http->pool_cs, i);
+						restructure_fds (fds, &nfds, http->pool_cs);
 					}
 				}
 			}
 		}
 	}
+}
+
+void htx_pool_http_make_srv (struct htx_pool_http *ph)
+{
+	for (int i = 0; i < ph->max; i++) {
+		init_http (ph->http[i]);
+		pthread_create (&ph->http[i]->thread, NULL, worker_http, ph->http[i]);
+	}
+
+
+}
+
+
+int main (int argc, char **argv)
+{
+
+	struct htx_pool_http *ph = htx_malloc_and_set (sizeof (struct htx_pool_http), 0);
+
+	struct htx_http_struc *http0 = htx_init_struct ("0.0.0.0", 8080, 5);
+	struct htx_http_struc *http1 = htx_init_struct ("0.0.0.0", 8090, 5);
+
+	int ret_pool = 0;
+	ret_pool += htx_pool_http_add (ph, http0);
+	ret_pool += htx_pool_http_add (ph, http1);
+
+	if (ret_pool > 0) {
+		htx_pool_http_free (ph);
+		exit (EXIT_FAILURE);
+	}
+
+	htx_pool_http_make_srv (ph);
+
+	struct htx_pool_com_files pcf;
 }
